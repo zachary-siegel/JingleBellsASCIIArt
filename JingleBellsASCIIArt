@@ -1,0 +1,875 @@
+#!/usr/bin/env python3
+"""
+JINGLE BELLS  -  Deluxe ASCII Christmas Scene
+=============================================
+A 256-color animated night scene that plays "Jingle Bells" (public domain,
+1857) and moves to the music, note for note and beat for beat.
+
+What's in the scene
+  * Moonlit twilight sky with a drifting aurora that flares on every note
+  * Crescent moon with halo, twinkling stars, shooting stars
+  * Layered mountains, pine forest, snow drifts with sparkling snow
+  * A big tiered Christmas tree with strings of chasing lights, ornaments
+    and a star that bursts into golden sparks on every melody note
+  * A log cabin with flickering windows and chimney smoke puffing on the beat
+  * A snowman who waves along to the rhythm, presents that hop on the downbeat
+  * Santa's sleigh and reindeer (Rudolph's nose blinks) flying across the sky,
+    trailing sparkles and dropping "jingle!" "ding!" "dong!"
+  * A little piano keyboard + progress bar at the bottom showing the music
+
+Audio: the song is synthesized (bells, glockenspiel, bass, shaker) into a .wav
+and played with afplay / paplay / aplay / ffplay, or winsound on Windows.
+No player found? The scene runs silently on the same tempo.
+
+Run:    python3 jingle_scene_deluxe.py          (Ctrl+C to quit)
+Needs:  a 256-color terminal, at least 100 columns x 34 rows
+        (make the window bigger or zoom out with Ctrl+minus)
+Extras: --silent   run without audio
+        --snapshot N   print a plain-text frame at beat N and exit
+Only the Python standard library is used.
+"""
+import bisect
+import math
+import os
+import random
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import wave
+
+# ------------------------------------------------------------------ settings
+W, H = 100, 34
+BPM = 132
+FPS = 24
+LATENCY = 0.0     # nudge if visuals feel early/late versus the audio (seconds)
+
+BEAT = 60.0 / BPM
+TAU = 2 * math.pi
+
+# ------------------------------------------------------------------ the song
+FREQ = {"C": 261.63, "D": 293.66, "E": 329.63, "F": 349.23, "G": 392.00}
+PITCH_IDX = {"C": 0, "D": 1, "E": 2, "F": 3, "G": 4}
+
+# (note, beats) - the well-known chorus, in C major
+MELODY = [
+    ("E", 1), ("E", 1), ("E", 2),
+    ("E", 1), ("E", 1), ("E", 2),
+    ("E", 1), ("G", 1), ("C", 1.5), ("D", 0.5),
+    ("E", 4),
+    ("F", 1), ("F", 1), ("F", 1.5), ("F", 0.5),
+    ("F", 1), ("E", 1), ("E", 1), ("E", 0.5), ("E", 0.5),
+    ("E", 1), ("D", 1), ("D", 1), ("E", 1),
+    ("D", 2), ("G", 2),
+]
+STARTS, _t = [], 0.0
+for _n, _l in MELODY:
+    STARTS.append(_t)
+    _t += _l
+SONG_BEATS = _t                       # 32
+PASS_BEATS = SONG_BEATS + 2           # chorus + 2 beats of rest
+PASSES = 2                            # second time round: everything gets bigger
+LOOP_BEATS = PASS_BEATS * PASSES
+LOOP_SECONDS = LOOP_BEATS * BEAT
+
+CHORDS = ["C", "C", "C", "C", "F", "C", "G", "G"]   # one per bar
+BASS = {"C": 130.81, "F": 174.61, "G": 196.00}
+
+SR = 22050
+_cache = {}
+
+
+def _tone(freq, dur, kind):
+    n = int(SR * (dur + 0.25))
+    key = (kind, round(freq, 2), n)
+    if key in _cache:
+        return _cache[key]
+    out = []
+    for i in range(n):
+        t = i / SR
+        if kind == "bell":
+            env = min(1.0, t / 0.004) * math.exp(-t * 3.0)
+            s = (math.sin(TAU * freq * t) + 0.35 * math.sin(TAU * 2 * freq * t)
+                 + 0.15 * math.sin(TAU * 3 * freq * t))
+        elif kind == "glock":
+            env = min(1.0, t / 0.002) * math.exp(-t * 7.0)
+            s = math.sin(TAU * freq * t) + 0.5 * math.sin(TAU * 2.76 * freq * t)
+        else:  # bass
+            env = min(1.0, t / 0.01) * math.exp(-t * 2.6)
+            s = math.sin(TAU * freq * t) + 0.4 * math.sin(TAU * 2 * freq * t)
+        out.append(s * env)
+    _cache[key] = out
+    return out
+
+
+def _shaker(seed):
+    r = random.Random(seed)
+    n = int(SR * 0.06)
+    prev, out = 0.0, []
+    for i in range(n):
+        v = r.uniform(-1, 1)
+        out.append((v - prev) * math.exp(-(i / SR) * 70))
+        prev = v
+    return out
+
+
+def make_wav(path):
+    total = int(SR * (LOOP_SECONDS + 1.0))
+    buf = [0.0] * total
+
+    def add(t0, wave_, amp):
+        i = int(t0 * SR)
+        j = min(total, i + len(wave_))
+        seg = wave_[: j - i]
+        buf[i:j] = [a + b * amp for a, b in zip(buf[i:j], seg)]
+
+    shakers = [_shaker(s) for s in range(4)]
+    for p in range(PASSES):
+        base = p * PASS_BEATS * BEAT
+        for (name, ln), st in zip(MELODY, STARTS):
+            f = FREQ[name]
+            add(base + st * BEAT, _tone(f, ln * BEAT, "bell"), 0.50)
+            if p == 1:                                   # sparkly glockenspiel on top
+                add(base + st * BEAT, _tone(f * 2, ln * BEAT, "glock"), 0.20)
+        for m, chord in enumerate(CHORDS):
+            for k in (0, 2):
+                add(base + (m * 4 + k) * BEAT, _tone(BASS[chord], 1.4 * BEAT, "bass"), 0.32)
+        for e in range(int(PASS_BEATS * 2)):             # sleigh-bell shaker, eighth notes
+            amp = (0.12 if e % 2 == 0 else 0.06) * (1.4 if p == 1 else 1.0)
+            add(base + e * 0.5 * BEAT, shakers[e % 4], amp)
+
+    peak = max(1e-9, max(abs(v) for v in buf))
+    scale = 0.85 * 32767 / peak
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes(struct.pack("<%dh" % total, *[int(v * scale) for v in buf]))
+
+
+def start_audio(path):
+    try:
+        if sys.platform == "win32":
+            import winsound
+            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return None
+        for cmd in (["afplay"], ["paplay"], ["aplay", "-q"],
+                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]):
+            if shutil.which(cmd[0]):
+                return subprocess.Popen(cmd + [path], stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    return None
+
+
+def stop_audio(proc):
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    elif sys.platform == "win32":
+        try:
+            import winsound
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------------ canvas
+class Canvas:
+    """Grid of (char, fg 256-color, bg 256-color) cells."""
+
+    def __init__(self):
+        self.ch = [[" "] * W for _ in range(H)]
+        self.fg = [[15] * W for _ in range(H)]
+        self.bg = [[16] * W for _ in range(H)]
+
+    def put(self, x, y, text, fg=15, bg=None):
+        """Draw text; spaces are transparent."""
+        if not 0 <= y < H:
+            return
+        rc, rf, rb = self.ch[y], self.fg[y], self.bg[y]
+        for i, c in enumerate(text):
+            xx = x + i
+            if c != " " and 0 <= xx < W:
+                rc[xx] = c
+                rf[xx] = fg
+                if bg is not None:
+                    rb[xx] = bg
+
+    def solid(self, x, y, bg, ch=" ", fg=None):
+        """Overwrite a cell completely (shape fill)."""
+        if 0 <= x < W and 0 <= y < H:
+            self.bg[y][x] = bg
+            self.ch[y][x] = ch
+            if fg is not None:
+                self.fg[y][x] = fg
+
+    def tint(self, x, y, bg):
+        if 0 <= x < W and 0 <= y < H:
+            self.bg[y][x] = bg
+
+    def rect(self, x, y, w, h, bg):
+        for yy in range(y, y + h):
+            for xx in range(x, x + w):
+                self.solid(xx, yy, bg)
+
+    def text(self):
+        return "\n".join("".join(r) for r in self.ch)
+
+    def render(self):
+        out = ["\x1b[?2026h\x1b[H"]
+        for y in range(H):
+            rc, rf, rb = self.ch[y], self.fg[y], self.bg[y]
+            lf = lb = None
+            for x in range(W):
+                c, f, b = rc[x], rf[x], rb[x]
+                if c == " " and lf is not None:
+                    f = lf
+                if f != lf or b != lb:
+                    out.append("\x1b[38;5;%d;48;5;%dm" % (f, b))
+                    lf, lb = f, b
+                out.append(c)
+            out.append("\x1b[0m")
+            if y < H - 1:
+                out.append("\n")
+        out.append("\x1b[?2026l")
+        return "".join(out)
+
+
+# ------------------------------------------------------------------ geometry
+HORIZON = 22
+GROUND_TOP = 23
+CX = 44                     # tree centre column
+TREE_TOP, TREE_ROWS = 12, 15
+STAR_Y = TREE_TOP - 2
+CBX = 68                    # cabin left edge
+SX, SB = 7, 30              # snowman left edge, base row
+
+rng = random.Random(2024)
+
+SKY_ANCHORS = [16, 16, 17, 17, 17, 18, 18, 53, 53, 54, 54]
+GROUND_ROWS = [231, 255, 255, 254, 254, 253, 253, 252, 252, 251]
+LIGHT_BGS = set(GROUND_ROWS) | {230, 229, 223, 189, 195}
+
+
+def sky_color(y):
+    return SKY_ANCHORS[min(len(SKY_ANCHORS) - 1, int(y / HORIZON * (len(SKY_ANCHORS) - 1)))]
+
+
+def far_h(x):
+    v = 5 + 3 * math.sin(x * 0.055 + 0.5) + 2 * math.sin(x * 0.13 + 2.0) + math.sin(x * 0.31)
+    return max(2.0, min(11.0, v))
+
+
+def near_h(x):
+    return max(0.5, 2.5 + 1.8 * math.sin(x * 0.09 + 1) + 1.2 * math.sin(x * 0.23))
+
+
+def ground_top(x):
+    return GROUND_TOP + int(round(math.sin(x * 0.12) + 0.6 * math.sin(x * 0.31 + 1)))
+
+
+STARS = [(rng.randrange(0, W), rng.randrange(1, 14), rng.random() * TAU, rng.choice([231, 231, 229, 159]))
+         for _ in range(70)]
+GTEX = [(rng.randrange(0, W), rng.randrange(24, H - 1), rng.choice(".,'-`"), rng.choice([146, 110, 147]))
+        for _ in range(90)]
+GSPARK = [(rng.randrange(0, W), rng.randrange(25, H - 1), rng.random() * TAU) for _ in range(30)]
+PINES = [(2, 5), (10, 4), (19, 6), (25, 4), (60, 5), (63, 4), (97, 5)]
+
+# --- tree geometry
+TIERS = [(0, 5, 0, 5), (5, 10, 3, 9), (10, 15, 6, 13)]
+HW = []
+for _i0, _i1, _a, _b in TIERS:
+    _n = _i1 - _i0
+    for _k in range(_n):
+        HW.append(int(_a + (_b - _a) * _k / (_n - 1) + 0.5))
+
+SWAGS = []     # strings of lights, each a list of (row, dx)
+for _s, _d in [(2, 2), (5, 2), (7, 2), (10, 2), (12, 2)]:
+    _hws = HW[_s]
+    _cells = []
+    for _dx in range(-_hws, _hws + 1):
+        _row = _s + int(_d * (1 - (_dx / _hws) ** 2) + 0.5)
+        if _row < TREE_ROWS and abs(_dx) <= HW[_row]:
+            _cells.append((_row, _dx))
+    SWAGS.append(_cells)
+
+ORNAMENTS = [(4, -2, 196), (4, 2, 220), (8, -5, 27), (8, 3, 201), (9, 0, 208), (11, -4, 45),
+             (12, 5, 196), (13, -8, 220), (13, 8, 201), (14, 2, 27), (14, -3, 208)]
+LIGHT_COLS = [196, 220, 51, 201, 46, 208]
+GREENS = [28, 28, 34, 34, 35, 41, 71]
+RAINBOW = [196, 208, 226, 46, 51, 201]
+
+SLEIGH = [
+    r"     _o_      ",
+    r"  __/_|_\__,  ",
+    r" (__________/ ",
+    r" '==========' ",
+]
+REINDEER = [
+    r"          \Y/ ",
+    r"  ,_____,_(o> ",
+    r" (_______)    ",
+]
+LEGS = [r"   //   \\    ", r"   \\   //    "]
+TRAIN_W = 14 + 2 + 13 + 2 + 13
+
+
+# ------------------------------------------------------------------ drawing
+def ph(bsong, k):
+    """Phase that makes exactly k full cycles per loop (seamless looping)."""
+    return TAU * k * bsong / LOOP_BEATS
+
+
+def draw_background(cv):
+    for y in range(H):
+        for x in range(W):
+            cv.bg[y][x] = sky_color(min(y, HORIZON))
+
+
+def draw_stars(cv, bsong):
+    for x, y, p, c in STARS:
+        v = math.sin(TAU * bsong / 4 + p)
+        cv.put(x, y, "*" if v > 0.75 else ("+" if v > 0.1 else "."), c if v > 0.1 else 244)
+
+
+def draw_aurora(cv, bsong, pulse, pass_no):
+    aur = [23, 29, 35, 41, 47, 48, 85]
+    boost = (1 if pulse > 0.35 else 0) + pass_no
+    for x in range(W):
+        if x % 3 == 2:                      # gaps make the curtain look like rays
+            continue
+        env = 0.5 + 0.5 * math.sin(x * 0.045 + ph(bsong, 1) + 1.3)
+        env2 = 0.5 + 0.5 * math.sin(x * 0.11 - ph(bsong, 2))
+        inten = env * 0.7 + env2 * 0.3
+        if inten < 0.42:
+            continue
+        y0 = 4.5 + 2.3 * math.sin(x * 0.08 + ph(bsong, 2)) + 1.3 * math.sin(x * 0.19 - ph(bsong, 3))
+        length = int(2 + 4 * inten + 2.5 * pulse)
+        for k in range(length):
+            y = int(y0) + k
+            if y < 1 or y > 13:
+                continue
+            frac = k / max(1, length - 1)
+            ci = int(frac * (len(aur) - 1) * (0.55 + 0.45 * inten)) + boost
+            col = aur[max(0, min(len(aur) - 1, ci))]
+            ch = "'" if k == 0 else (":" if k == length - 1 else "|")
+            cv.put(x, y, ch, col)
+
+
+def draw_moon(cv, pulse):
+    cx, cy = 89, 6
+    for y in range(cy - 6, cy + 7):
+        for x in range(cx - 12, cx + 13):
+            dx, dy = (x - cx) / 2.0, y - cy
+            d = math.hypot(dx, dy)
+            if d <= 3.2 and math.hypot((x - cx - 2) / 2.0, dy + 0.5) > 2.8:
+                cv.solid(x, y, 230)
+                if (x * 5 + y * 11) % 13 == 0:
+                    cv.put(x, y, "o", 187)
+            elif d <= 4.6:
+                if 0 <= x < W and 0 <= y < H:
+                    cv.ch[y][x] = " "          # keep the moon's neighbourhood clear
+                    if 3.5 < d <= 4.2 and (x + y) % 2 == 0:
+                        cv.put(x, y, "*" if pulse > 0.4 else ".", 146 if pulse > 0.4 else 60)
+
+
+def draw_shooting_star(cv, beat):
+    group, local = divmod(beat, 8.0)
+    local -= 3.0
+    if not 0 <= local < 1.6:
+        return
+    r = random.Random(int(group))
+    x0, y0 = r.randint(40, 98), r.randint(1, 5)
+    u = local / 1.6
+    for k in range(7):
+        uu = u - k * 0.03
+        if uu < 0:
+            break
+        x, y = int(x0 - 38 * uu), int(y0 + 9 * uu)
+        cv.put(x, y, "*" if k == 0 else ("-" if k < 3 else "."), 231 if k < 3 else 250 - k * 2)
+
+
+def draw_mountains(cv):
+    tops = [int(HORIZON - far_h(x)) for x in range(W + 1)]
+    for x in range(W):
+        h = far_h(x)
+        top = tops[x]
+        for y in range(top, HORIZON + 4):
+            cv.solid(x, y, 146 if (y < top + 2 and h > 7.5) else 60)
+        nxt = tops[x + 1]
+        ridge = "/" if nxt < top else ("\\" if nxt > top else "_")
+        cv.put(x, top, ridge, 189, 60 if h <= 7.5 else 146)
+    # low dark foothills in front of the range
+    for x in range(W):
+        n = int(near_h(x))
+        for y in range(HORIZON + 1 - n, GROUND_TOP + 3):
+            cv.solid(x, y, 236)
+
+
+def draw_pines(cv):
+    for px, h in PINES:
+        base = GROUND_TOP + 1
+        y0 = base - h
+        for r in range(h):
+            w = 1 + 2 * r
+            for xx in range(px - r, px - r + w):
+                cv.solid(xx, y0 + r, 22)
+            if r == 0:
+                cv.put(px, y0, "^", 231)
+            else:
+                cv.put(px - r, y0 + r, "/", 28)
+                cv.put(px + r, y0 + r, "\\", 28)
+                if (px * 3 + r * 7) % 3 == 0:
+                    cv.put(px - r + 2, y0 + r, ".", 231)
+        cv.solid(px, base, 94)
+
+
+def draw_ground(cv, bsong):
+    for x in range(W):
+        gt = ground_top(x)
+        for y in range(gt, H):
+            cv.solid(x, y, GROUND_ROWS[min(len(GROUND_ROWS) - 1, y - gt)])
+    for x, y, ch, col in GTEX:
+        if y > ground_top(x) + 1:
+            cv.put(x, y, ch, col)
+    for x, y, p in GSPARK:
+        v = math.sin(TAU * bsong / 2 + p)
+        if y > ground_top(x) + 1 and v > 0.8:
+            cv.put(x, y, "*", 117 if v < 0.95 else 51)
+
+
+def draw_tree(cv, bsong, bi, pulse, pitch, pass_no):
+    # body
+    for i in range(TREE_ROWS):
+        y, hw = TREE_TOP + i, HW[i]
+        for dx in range(-hw, hw + 1):
+            x = CX + dx
+            h = (x * 7 + y * 13 + x * y) % 9
+            if i == 0:
+                ch, fg = "^", 71
+            elif dx == -hw:
+                ch, fg = "/", 35
+            elif dx == hw:
+                ch, fg = "\\", 35
+            elif i in (4, 9, 14):
+                ch, fg = "_", 28
+            else:
+                ch = "'`\"*.,'\"`"[h]
+                t = (dx + hw) / (2.0 * hw)
+                fg = GREENS[min(len(GREENS) - 1, int(t * len(GREENS)))]
+                if h == 0:
+                    ch, fg = ".", 231          # a bit of snow on the branches
+            cv.solid(x, y, 22, ch, fg)
+    for yy in (TREE_TOP + TREE_ROWS, TREE_TOP + TREE_ROWS + 1):
+        for xx in range(CX - 2, CX + 3):
+            cv.solid(xx, yy, 94, "#", 58)
+
+    band = None
+    if pitch is not None and pulse > 0.3:
+        s = 12 - pitch * 3
+        band = (s, s + 2)
+    speed = 2 if pass_no else 1
+
+    # strings of lights (chase on the beat) with wire between
+    idc = 0
+    for swag in SWAGS:
+        for j, (row, dx) in enumerate(swag):
+            x, y = CX + dx, TREE_TOP + row
+            if j % 2 == 0:
+                col = LIGHT_COLS[(idc + bi * speed) % len(LIGHT_COLS)]
+                ch = "o" if (idc + int(bsong * 2)) % 3 == 0 else "O"
+                if band and band[0] <= row <= band[1]:
+                    ch, col = "@", 231
+                cv.put(x, y, ch, col)
+                idc += 1
+            else:
+                cv.put(x, y, "~", 178)
+    for row, dx, col in ORNAMENTS:
+        x, y = CX + dx, TREE_TOP + row
+        if band and band[0] <= row <= band[1]:
+            cv.put(x, y, "*", 226)
+        else:
+            cv.put(x, y, "O", col if (bi + dx) % 2 else col - 1 if col > 200 else col)
+
+    # star: grows rays on each note
+    sy = STAR_Y
+    cv.put(CX - 1, sy, "<*>", 226)
+    if pulse > 0.25:
+        cv.put(CX - 1, sy - 1, "\\|/", 231)
+        cv.put(CX - 1, sy + 1, "/|\\", 231)
+    if pulse > 0.6:
+        cv.put(CX - 6, sy, "-- ", 220)
+        cv.put(CX + 3, sy, " --", 220)
+
+
+def draw_present(cv, x, base, w, h, col, rib):
+    for yy in range(base - h + 1, base + 1):
+        for xx in range(x, x + w):
+            cv.solid(xx, yy, col)
+    mid = x + w // 2
+    for yy in range(base - h + 1, base + 1):
+        cv.solid(mid, yy, rib)
+    cv.solid(x, base - h // 2, rib)
+    for xx in range(x, x + w):
+        cv.solid(xx, base - h // 2, rib)
+    cv.put(mid - 1, base - h, "\\@/", rib)
+
+
+def draw_presents(cv, bi, fb):
+    hop = 1 if (bi % 4 == 0 and fb < 0.25) else 0
+    specs = [(CX - 15, 7, 3, 196, 226), (CX - 7, 5, 2, 27, 231),
+             (CX + 4, 6, 3, 34, 196), (CX + 12, 7, 2, 201, 226)]
+    for i, (x, w, h, c, r) in enumerate(specs):
+        draw_present(cv, x, 31 - (hop if i % 2 == 0 else (1 - hop if bi % 4 == 0 and fb < 0.25 else 0)), w, h, c, r)
+
+
+def draw_cabin(cv, bsong, bi, pulse):
+    mid = CBX + 13
+    # light spilling from windows
+    wins = [CBX + 2, CBX + 17]
+    warm = [220, 214, 214, 208, 220, 221]
+    for wi, wx in enumerate(wins):
+        for yy, c in ((30, 230), (31, 229)):
+            for xx in range(wx - 1, wx + 8):
+                cv.tint(xx, yy, c)
+    # roof
+    for r in range(6):
+        y, hw = 24 - r, 15 - 3 * r
+        for x in range(mid - hw, mid + hw + 1):
+            edge = x < mid - hw + 3 or x > mid + hw - 3 or r == 5
+            if edge:
+                cv.solid(x, y, 255)
+            else:
+                cv.solid(x, y, 52, "=" if (x + y) % 2 else "-", 88)
+        cv.put(mid - hw, y, "/", 245)
+        cv.put(mid + hw, y, "\\", 245)
+    # chimney
+    for y in range(18, 23):
+        for x in range(CBX + 19, CBX + 23):
+            cv.solid(x, y, 124, "#", 88)
+    for x in range(CBX + 18, CBX + 24):
+        cv.solid(x, 17, 240)
+    # walls (log cabin)
+    for y in range(25, 30):
+        for x in range(CBX, CBX + 26):
+            cv.solid(x, y, 94, "=" if y % 2 else "-", 130 if y % 2 else 58)
+    for x in range(CBX, CBX + 26):
+        if x % 3 == 0:
+            cv.put(x, 25, "v", 159)
+    # windows
+    for wi, wx in enumerate(wins):
+        c = warm[(int(bsong * 3) + wi * 2) % len(warm)]
+        for yy in (26, 27):
+            for xx in range(wx, wx + 7):
+                cv.solid(xx, yy, c)
+            cv.solid(wx - 1, yy, 22)
+            cv.solid(wx + 7, yy, 22)
+            cv.put(wx + 3, yy, "|", 94)
+        for xx in range(wx - 1, wx + 8):
+            cv.put(xx, 28, "=", 250)
+    # door + wreath
+    for y in range(26, 30):
+        for x in range(CBX + 11, CBX + 15):
+            cv.solid(x, y, 52)
+    cv.put(CBX + 13, 28, "o", 220)
+    cv.put(CBX + 11, 26, "{", 28)
+    cv.put(CBX + 12, 26, "@", 196)
+    cv.put(CBX + 13, 26, "@", 196 if bi % 2 else 160)
+    cv.put(CBX + 14, 26, "}", 28)
+
+
+def draw_snowman(cv, bi):
+    r = SB - 9
+    rows = [("   ___   ", 235), ("  |___|  ", 235), (" (_____) ", 235),
+            ("  (o o)  ", 231), ("  ( > )  ", 231), ("  ~~~~~  ", 196),
+            (" (  :  ) ", 231), ("(   :   )", 231), ("(   :   )", 231), (" `-----' ", 231)]
+    for i, (s, bgc) in enumerate(rows):
+        a, b = len(s) - len(s.lstrip()), len(s.rstrip())
+        for xx in range(a, b):
+            cv.solid(SX + xx, r + i, bgc, " ", 244)
+        for xx in range(a, b):
+            if s[xx] != " ":
+                cv.put(SX + xx, r + i, s[xx], 245 if bgc == 231 else 250)
+    cv.put(SX + 3, r + 3, "o", 16)
+    cv.put(SX + 5, r + 3, "o", 16)
+    cv.put(SX + 4, r + 4, ">", 208)
+    for xx in range(2, 7):
+        cv.solid(SX + xx, r + 5, 196, "~", 160)
+    cv.put(SX + 7, r + 5 + (bi % 2), "~", 196)
+    cv.put(SX + 8, r + 6 - (bi % 2) + 1, "~", 196)
+    for yy in (6, 7, 8):
+        cv.put(SX + 4, r + yy, "o", 16)
+    # arms wave in turn
+    if bi % 2 == 0:
+        cv.put(SX - 1, r + 6, "\\", 94); cv.put(SX - 2, r + 5, "\\", 94); cv.put(SX - 3, r + 4, "Y", 94)
+        cv.put(SX + 9, r + 7, "_", 94); cv.put(SX + 10, r + 8, "\\", 94)
+    else:
+        cv.put(SX + 9, r + 6, "/", 94); cv.put(SX + 10, r + 5, "/", 94); cv.put(SX + 11, r + 4, "Y", 94)
+        cv.put(SX - 1, r + 7, "_", 94); cv.put(SX - 2, r + 8, "/", 94)
+
+
+def draw_sprite(cv, x, y, lines, fg):
+    for i, s in enumerate(lines):
+        cv.put(x, y + i, s, fg)
+
+
+def sleigh_pos(bsong):
+    L = W + TRAIN_W + 10
+    u = (bsong % PASS_BEATS) / PASS_BEATS
+    x = int(u * L) - TRAIN_W
+    y = 12 - int(5 * math.sin(math.pi * u))
+    return x, y
+
+
+def draw_sleigh(cv, beat, bsong, S, dt):
+    bi, fb = int(beat), beat - int(beat)
+    x, y = sleigh_pos(bsong)
+    y += 1 if (fb < 0.3) else 0
+    frame = int(beat * 2) % 2
+    # reins
+    for xx in range(x + 13, x + 31 + 1):
+        cv.put(xx, y + 3, "-", 220)
+    # sleigh
+    for i, s in enumerate(SLEIGH):
+        cv.put(x, y + i, s, 196 if i < 3 else 220)
+    cv.put(x + 5, y, "_", 196); cv.put(x + 6, y, "o", 217); cv.put(x + 7, y, "_", 196)
+    cv.put(x + 1, y, "[#]", 51)
+    cv.put(x + 3, y - 1, "[%]", 213)
+    # two reindeer, galloping out of phase
+    for k, rx in enumerate((x + 16, x + 31)):
+        ry = y + 1 + ((frame + k) % 2)
+        lines = REINDEER + [LEGS[(frame + k) % 2]]
+        draw_sprite(cv, rx, ry, lines, 137)
+        if k == 1:   # Rudolph
+            cv.put(rx + 11, ry + 1, "O" if bi % 2 == 0 else "o", 196)
+            if bi % 2 == 0:
+                cv.put(rx + 13, ry + 1, "*", 217)
+    # particles
+    if dt > 0 and -TRAIN_W + 4 < x < W:
+        for _ in range(2):
+            S["parts"].append([x + 1 + random.random() * 3, y + 3 + random.random() * 2,
+                               random.uniform(-3, 0), random.uniform(0, 2), 1.4, 1.4,
+                               [("*", 231), ("*", 226), ("+", 220), (".", 178), (".", 136)], 4.0])
+    return x, y
+
+
+def spawn_beat_effects(S, bi, bsong):
+    # chimney smoke puffs on every beat (big one on the downbeat)
+    S["parts"].append([CBX + 20.5, 16.0, 2.0, -4.0, 3.2, 3.2,
+                       [(".", 252), ("o", 252), ("O", 250), ("O", 247), ("o", 244), (".", 240)], 0.0])
+    if bi % 4 == 0:
+        S["parts"].append([CBX + 20.0, 16.0, 2.5, -3.5, 3.4, 3.4,
+                           [("O", 252), ("O", 250), ("@", 247), ("O", 244), ("o", 241), (".", 240)], 0.0])
+    # floating sleigh-bell words
+    x, y = sleigh_pos(bsong)
+    if -TRAIN_W + 6 < x < W - 8:
+        word = ["jingle!", "ding!", "jingle!", "dong!"][bi % 4]
+        S["parts"].append([x + 3, y - 1, 0.0, -2.5, 1.1, 1.1,
+                           [(word, 231), (word, 229), (word, 223), (word, 180)], 0.0])
+
+
+def spawn_note_sparks(S, pass_no):
+    for _ in range(11 + 10 * pass_no):
+        a = random.uniform(0, TAU)
+        r = random.uniform(6, 17)
+        S["parts"].append([CX, STAR_Y, math.cos(a) * r, math.sin(a) * r * 0.5, random.uniform(0.7, 1.3), 1.3,
+                           [("*", 231), ("*", 226), ("+", 220), (".", 178), (".", 136)], 9.0])
+
+
+def update_particles(S, dt):
+    alive = []
+    for p in S["parts"]:
+        p[0] += p[2] * dt
+        p[1] += p[3] * dt
+        p[3] += p[7] * dt
+        p[4] -= dt
+        if p[4] > 0:
+            alive.append(p)
+    S["parts"] = alive
+
+
+def draw_particles(cv, S):
+    for x, y, vx, vy, life, mx, seq, g in S["parts"]:
+        frac = 1 - life / mx
+        t, c = seq[min(len(seq) - 1, int(frac * len(seq)))]
+        cv.put(int(x), int(y), t, c)
+
+
+def new_snow():
+    flakes = []
+    for layer, n in ((0, 40), (1, 30), (2, 14)):
+        for _ in range(n):
+            flakes.append([random.uniform(0, W), random.uniform(0, H - 2),
+                           random.uniform(1.0, 2.0) * (1 + layer * 1.4), random.uniform(0, TAU), layer])
+    return flakes
+
+
+def draw_snow(cv, S, bsong, dt, layers):
+    wind = 1.5 * math.sin(TAU * bsong / PASS_BEATS)
+    for f in S["snow"]:
+        if dt > 0:
+            f[1] += f[2] * dt * 3
+            if f[1] >= H - 1:
+                f[0], f[1] = random.uniform(0, W), 0
+        if f[4] not in layers:
+            continue
+        x = int(f[0] + (2 + f[4]) * math.sin(f[3] + bsong * 0.7) + wind * (f[4] + 1) * 1.5) % W
+        y = int(f[1])
+        light = 0 <= y < H and cv.bg[y][x] in LIGHT_BGS
+        ch = "." if f[4] == 0 else ("+" if f[4] == 1 else "*")
+        cv.put(x, y, ch, 117 if light else 231)
+
+
+def draw_title(cv, bi):
+    text = "* * *   J I N G L E   B E L L S   * * *"
+    x0 = (W - len(text)) // 2
+    for i, c in enumerate(text):
+        cv.solid(x0 + i, 0, sky_color(0), c, RAINBOW[(i // 2 + bi) % len(RAINBOW)])
+
+
+def draw_hud(cv, bsong, bi, pitch_name, pulse, pass_no):
+    y = H - 1
+    for x in range(W):
+        cv.solid(x, y, 234)
+    cv.put(2, y, "JINGLE BELLS", 231)
+    cv.put(15, y, "%d BPM" % BPM, 245)
+    # little piano
+    cv.put(28, y, "keys", 245)
+    for i, n in enumerate("CDEFG"):
+        pressed = (n == pitch_name and pulse > 0.15)
+        cv.put(33 + i * 4, y, "[%s]" % n, 16 if pressed else 252, 226 if pressed else 238)
+    # progress
+    frac = bsong / LOOP_BEATS
+    filled = int(frac * 24)
+    bar = "#" * filled + "-" * (24 - filled)
+    cv.put(58, y, "chorus %d/%d" % (pass_no + 1, PASSES), 245)
+    cv.put(71, y, "[", 245)
+    cv.put(72, y, bar[:filled], 46)
+    cv.put(72 + filled, y, bar[filled:], 240)
+    cv.put(96, y, "]", 245)
+
+
+def new_state():
+    return {"parts": [], "snow": new_snow(), "beat": -1, "note": -1}
+
+
+def draw_frame(cv, beat, dt, S):
+    bi = int(beat)
+    fb = beat - bi
+    bsong = beat % LOOP_BEATS
+    pass_no = int(bsong // PASS_BEATS)
+    pb = bsong - pass_no * PASS_BEATS
+    pulse, pitch, pname, note_id = 0.0, None, "-", -1
+    if pb < SONG_BEATS:
+        idx = bisect.bisect_right(STARTS, pb) - 1
+        pulse = math.exp(-(pb - STARTS[idx]) * 2.5)
+        pname = MELODY[idx][0]
+        pitch = PITCH_IDX[pname]
+        note_id = pass_no * 100 + idx
+
+    if bi != S["beat"]:
+        S["beat"] = bi
+        spawn_beat_effects(S, bi, bsong)
+    if note_id != S["note"]:
+        S["note"] = note_id
+        if note_id >= 0:
+            spawn_note_sparks(S, pass_no)
+
+    # sky
+    draw_background(cv)
+    draw_stars(cv, bsong)
+    draw_aurora(cv, bsong, pulse, pass_no)
+    draw_moon(cv, pulse)
+    draw_shooting_star(cv, beat)
+    draw_snow(cv, S, bsong, dt, (0,))
+    # land
+    draw_mountains(cv)
+    draw_pines(cv)
+    draw_ground(cv, bsong)
+    draw_cabin(cv, bsong, bi, pulse)
+    draw_snowman(cv, bi)
+    draw_tree(cv, bsong, bi, pulse, pitch, pass_no)
+    draw_presents(cv, bi, fb)
+    draw_sleigh(cv, beat, bsong, S, dt)
+    # effects
+    update_particles(S, dt)
+    draw_particles(cv, S)
+    draw_snow(cv, S, bsong, 0, (1, 2))
+    draw_title(cv, bi)
+    draw_hud(cv, bsong, bi, pname, pulse, pass_no)
+
+
+# ------------------------------------------------------------------ main
+def check_size():
+    cols, rows = shutil.get_terminal_size((W, H))
+    if cols < W or rows < H:
+        print("Your terminal is %dx%d but this scene needs at least %dx%d." % (cols, rows, W, H))
+        print("Enlarge the window or zoom out (Ctrl + minus), then press Enter...")
+        try:
+            input()
+        except EOFError:
+            pass
+
+
+def snapshot(target):
+    S = new_state()
+    random.seed(5)
+    S["snow"] = new_snow()
+    dt = 1.0 / FPS
+    t, cv = 0.0, None
+    while t <= target * BEAT:
+        cv = Canvas()
+        draw_frame(cv, t / BEAT, dt, S)
+        t += dt
+    return cv
+
+
+def main():
+    if "--snapshot" in sys.argv:
+        cv = snapshot(float(sys.argv[sys.argv.index("--snapshot") + 1]))
+        print(cv.text())
+        return
+    silent = "--silent" in sys.argv
+    os.system("")                       # enable ANSI on Windows terminals
+    check_size()
+    wav = None
+    if not silent:
+        print("Tuning the bells (generating audio)...")
+        wav = os.path.join(tempfile.gettempdir(), "jingle_scene_deluxe.wav")
+        make_wav(wav)
+    sys.stdout.write("\x1b[?25l\x1b[2J")
+    proc = None
+    S = new_state()
+    try:
+        while True:
+            proc = start_audio(wav) if wav else None
+            t0 = last = time.monotonic()
+            S["beat"] = S["note"] = -1
+            while True:
+                now = time.monotonic()
+                beat = max(0.0, (now - t0 - LATENCY) / BEAT)
+                if beat >= LOOP_BEATS:
+                    break
+                cv = Canvas()
+                draw_frame(cv, beat, min(0.1, now - last), S)
+                last = now
+                sys.stdout.write(cv.render())
+                sys.stdout.flush()
+                time.sleep(max(0.0, 1.0 / FPS - (time.monotonic() - now)))
+            stop_audio(proc)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_audio(proc)
+        sys.stdout.write("\x1b[0m\x1b[?25h\x1b[2J\x1b[H")
+        print("Merry Christmas! 🎄")
+
+
+if __name__ == "__main__":
+    main()
